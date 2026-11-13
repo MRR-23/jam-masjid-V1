@@ -29,6 +29,46 @@
         "lastUpdated": { "type": "string" }
       },
       "required": ["currentJuz", "currentSurah", "lastUpdated"]
+    },
+    "CloudSlide": {
+      "title": "CloudSlide",
+      "description": "Individual photo or video slide metadata synced cross-device",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "type": { "type": "string" },
+        "dataUrl": { "type": "string" },
+        "thumbnailUrl": { "type": "string" },
+        "isChunked": { "type": "boolean" },
+        "chunkCount": { "type": "number" },
+        "durationSeconds": { "type": "number" },
+        "active": { "type": "boolean" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "type"]
+    },
+    "CloudSlideChunk": {
+      "title": "CloudSlideChunk",
+      "description": "Chunked media payload for large photos or videos synced cross-device",
+      "type": "object",
+      "properties": {
+        "slideId": { "type": "string" },
+        "index": { "type": "number" },
+        "data": { "type": "string" }
+      },
+      "required": ["slideId", "index", "data"]
+    },
+    "CloudMedia": {
+      "title": "CloudMedia",
+      "description": "Shared media assets such as himbauan shaf image synced across devices",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "dataUrl": { "type": "string" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "dataUrl"]
     }
   },
   "firestore": {
@@ -39,6 +79,18 @@
     "/murattal_progress/{progressId}": {
       "schema": "MurattalProgress",
       "description": "Synced 30 juz murattal progress state"
+    },
+    "/cloud_slides/{slideId}": {
+      "schema": "CloudSlide",
+      "description": "Cross-device shared photo, video, and announcement slides"
+    },
+    "/cloud_slide_chunks/{chunkId}": {
+      "schema": "CloudSlideChunk",
+      "description": "Chunked binary/base64 segments for cross-device video and large image sync"
+    },
+    "/cloud_media/{mediaId}": {
+      "schema": "CloudMedia",
+      "description": "Cross-device shared standalone media like himbauan shaf poster"
     }
   }
 }

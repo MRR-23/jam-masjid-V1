@@ -15,14 +15,19 @@ import { SecretLineTrigger } from './components/SecretLineTrigger';
 import { AdminDrawer } from './components/AdminDrawer';
 import { FridayMurattalPlayer } from './components/FridayMurattalPlayer';
 import { db } from './firebase';
-import { doc, onSnapshot, setDoc, getDoc } from 'firebase/firestore';
+import { collection, doc, onSnapshot, setDoc, getDocFromServer } from 'firebase/firestore';
 import { X } from 'lucide-react';
 import { 
   saveMosqueConfig, 
   loadMosqueConfig, 
   safeLocalStorageGet, 
   prepareConfigForFirestore,
-  mergeCloudWithLocalMedia
+  mergeCloudWithLocalMedia,
+  backfillLocalMediaToCloud,
+  fetchCloudSlideMedia,
+  fetchCloudHimbauanMedia,
+  isSlideMediaCached,
+  deleteSlideMedia
 } from './utils/storageManager';
 
 export default function App() {
@@ -38,23 +43,6 @@ export default function App() {
         : DEFAULT_MOSQUE_CONFIG.runningTexts
     };
   });
-
-  // Load complete configuration (including high-resolution slides) from IndexedDB
-  useEffect(() => {
-    loadMosqueConfig().then((loaded) => {
-      if (loaded && loaded.mosqueName) {
-        setConfig((prev) => ({
-          ...DEFAULT_MOSQUE_CONFIG,
-          ...prev,
-          ...loaded,
-          slides: Array.isArray(loaded.slides) ? loaded.slides : (Array.isArray(prev.slides) ? prev.slides : []),
-          runningTexts: Array.isArray(loaded.runningTexts) && loaded.runningTexts.length > 0
-            ? loaded.runningTexts
-            : (Array.isArray(prev.runningTexts) && prev.runningTexts.length > 0 ? prev.runningTexts : DEFAULT_MOSQUE_CONFIG.runningTexts)
-        }));
-      }
-    });
-  }, []);
 
   const [murattalProgress, setMurattalProgress] = useState<MurattalProgress>(DEFAULT_MURATTAL_PROGRESS);
   const [isCloudSynced, setIsCloudSynced] = useState<boolean>(false);
@@ -75,6 +63,8 @@ export default function App() {
 
   // Prevent repeated automatic triggers in the same cycle
   const lastTriggeredPrayerRef = useRef<string | null>(null);
+  const backfilledIdsRef = useRef<Set<string>>(new Set());
+  const latestCloudDataRef = useRef<MosqueConfig | null>(null);
 
   // Real-time tick every second
   useEffect(() => {
@@ -84,58 +74,128 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-  // Listen to Firestore config in real-time & hydrate local media
+  // Listen to Firestore config, cloud_slides & cloud_media in real-time across all accounts/devices
   useEffect(() => {
-    // Immediately load local media & settings from IndexedDB
+    let isMounted = true;
+
+    // Immediately load local media & settings from IndexedDB for instant display
     loadMosqueConfig().then((local) => {
-      if (local) setConfig(local);
+      if (isMounted && local && local.mosqueName) {
+        setConfig((prev) => ({
+          ...DEFAULT_MOSQUE_CONFIG,
+          ...prev,
+          ...local,
+          slides: Array.isArray(local.slides) ? local.slides : (Array.isArray(prev.slides) ? prev.slides : []),
+          runningTexts: Array.isArray(local.runningTexts) && local.runningTexts.length > 0
+            ? local.runningTexts
+            : (Array.isArray(prev.runningTexts) && prev.runningTexts.length > 0 ? prev.runningTexts : DEFAULT_MOSQUE_CONFIG.runningTexts)
+        }));
+      }
     }).catch(() => {});
 
     const configDocRef = doc(db, 'settings', 'main');
-    
-    // Seed initial document if not exists
-    getDoc(configDocRef).then((snap) => {
+
+    // Seed initial document ONLY if server confirms document does not exist
+    getDocFromServer(configDocRef).then((snap) => {
       if (!snap.exists()) {
         const payload = prepareConfigForFirestore(DEFAULT_MOSQUE_CONFIG);
         setDoc(configDocRef, payload).catch(() => {});
-      } else {
+      } else if (isMounted) {
         setIsCloudSynced(true);
       }
     }).catch(() => {});
 
-    const unsubscribe = onSnapshot(configDocRef, async (snap) => {
+    const applyCloudSnapshot = async (cloudData: MosqueConfig) => {
+      const currentLocal = await loadMosqueConfig();
+      const merged = await mergeCloudWithLocalMedia(cloudData, currentLocal);
+      const safeMerged: MosqueConfig = {
+        ...DEFAULT_MOSQUE_CONFIG,
+        ...merged,
+        slides: Array.isArray(merged.slides) ? merged.slides : [],
+        runningTexts: Array.isArray(merged.runningTexts) && merged.runningTexts.length > 0
+          ? merged.runningTexts
+          : DEFAULT_MOSQUE_CONFIG.runningTexts
+      };
+      if (!isMounted) return;
+      setConfig(safeMerged);
+      await saveMosqueConfig(safeMerged);
+      setIsCloudSynced(true);
+
+      // Automatically backfill any local-only slides/himbauan to cloud_slides so all accounts receive them
+      backfillLocalMediaToCloud(safeMerged, backfilledIdsRef.current).catch(() => {});
+
+      const hasLegacySample = Array.isArray(cloudData.slides) && cloudData.slides.some(
+        s => s.id === 'slide-1' || s.id === 'default-mosque-banner' || (s.url && s.url.includes('masjid_al_mujahidin_bg'))
+      );
+      if (hasLegacySample) {
+        const cleanedPayload = prepareConfigForFirestore(merged);
+        setDoc(configDocRef, cleanedPayload, { merge: true }).catch(() => {});
+      }
+    };
+
+    const unsubscribeSettings = onSnapshot(configDocRef, async (snap) => {
       if (snap.exists()) {
         const cloudData = snap.data() as MosqueConfig;
-        const currentLocal = await loadMosqueConfig();
-        const merged = await mergeCloudWithLocalMedia(cloudData, currentLocal);
-        const safeMerged: MosqueConfig = {
-          ...DEFAULT_MOSQUE_CONFIG,
-          ...merged,
-          slides: Array.isArray(merged.slides) ? merged.slides : [],
-          runningTexts: Array.isArray(merged.runningTexts) && merged.runningTexts.length > 0
-            ? merged.runningTexts
-            : DEFAULT_MOSQUE_CONFIG.runningTexts
-        };
-        setConfig(safeMerged);
-        await saveMosqueConfig(safeMerged);
-        setIsCloudSynced(true);
-
-        // If cloud data still contained legacy demo slides, sanitize cloud document
-        const hasLegacySample = Array.isArray(cloudData.slides) && cloudData.slides.some(
-          s => s.id === 'slide-1' || s.id === 'default-mosque-banner' || (s.url && s.url.includes('masjid_al_mujahidin_bg'))
-        );
-        if (hasLegacySample) {
-          const cleanedPayload = prepareConfigForFirestore(merged);
-          setDoc(configDocRef, cleanedPayload, { merge: true }).catch(() => {});
-        }
+        latestCloudDataRef.current = cloudData;
+        await applyCloudSnapshot(cloudData);
       }
-    }, (error) => {
-      // Offline fallback: keep local configuration active
-      console.warn("Firestore snapshot notice:", error?.message);
-      setIsCloudSynced(false);
+    }, () => {
+      if (isMounted) setIsCloudSynced(false);
     });
 
-    return () => unsubscribe();
+    // Listen to cloud_slides so media uploaded from any account/device hydrates immediately even if chunks finish after settings/main
+    const unsubscribeSlides = onSnapshot(collection(db, 'cloud_slides'), async (snapshot) => {
+      if (!isMounted || snapshot.empty) return;
+      const changes = snapshot.docChanges();
+      if (changes.length === 0) return;
+
+      let needsRefresh = false;
+      for (const change of changes) {
+        if (change.type === 'added' || change.type === 'modified') {
+          const slideId = change.doc.id;
+          const alreadyCached = change.type === 'added' ? await isSlideMediaCached(slideId) : false;
+          if (!alreadyCached) {
+            const fetched = await fetchCloudSlideMedia(slideId);
+            if (fetched?.url) {
+              needsRefresh = true;
+            }
+          }
+        }
+      }
+
+      if (needsRefresh && latestCloudDataRef.current && isMounted) {
+        await applyCloudSnapshot(latestCloudDataRef.current);
+      }
+    }, () => {});
+
+    // Listen to cloud_media/himbauan_image for real-time cross-account poster updates
+    const unsubscribeHimbauanMedia = onSnapshot(doc(db, 'cloud_media', 'himbauan_image'), async (snap) => {
+      if (!isMounted) return;
+      if (snap.exists()) {
+        const imgUrl = await fetchCloudHimbauanMedia();
+        if (imgUrl && isMounted) {
+          setConfig((prev) => ({
+            ...prev,
+            himbauan: {
+              enabled: prev.himbauan?.enabled ?? true,
+              durationSeconds: prev.himbauan?.durationSeconds ?? 60,
+              title: prev.himbauan?.title || 'Himbauan Luruskan dan Rapatkan Shaf',
+              subtitle: prev.himbauan?.subtitle || DEFAULT_MOSQUE_CONFIG.himbauan?.subtitle || '',
+              imageUrl: imgUrl
+            }
+          }));
+        }
+      } else {
+        await deleteSlideMedia('himbauan_image').catch(() => {});
+      }
+    }, () => {});
+
+    return () => {
+      isMounted = false;
+      unsubscribeSettings();
+      unsubscribeSlides();
+      unsubscribeHimbauanMedia();
+    };
   }, []);
 
   // Calculate prayer times
@@ -229,6 +289,9 @@ export default function App() {
       const firestorePayload = prepareConfigForFirestore(updated);
       await setDoc(configDocRef, firestorePayload, { merge: true });
       setIsCloudSynced(true);
+
+      // Ensure any locally-stored slides/himbauan are also synced to cloud_slides / cloud_media
+      backfillLocalMediaToCloud(updated, backfilledIdsRef.current).catch(() => {});
     } catch {
       // Offline fallback: data is securely saved in IndexedDB & localStorage
       setIsCloudSynced(false);
@@ -246,8 +309,8 @@ export default function App() {
     try {
       const ref = doc(db, 'murattal_progress', 'current');
       await setDoc(ref, updated, { merge: true });
-    } catch (err) {
-      console.warn("Failed to update murattal progress:", err);
+    } catch {
+      // Offline mode: state updated locally
     }
   }, [murattalProgress]);
 
@@ -378,8 +441,7 @@ export default function App() {
         try {
           const promise = requestMethod.call(elem);
           if (promise && typeof promise.catch === 'function') {
-            promise.catch((err: any) => {
-              console.warn('requestFullscreen on documentElement failed, trying document.body:', err);
+            promise.catch(() => {
               const body = document.body as any;
               const bodyMethod = body.requestFullscreen || body.webkitRequestFullscreen;
               if (bodyMethod) {
@@ -387,8 +449,8 @@ export default function App() {
               }
             });
           }
-        } catch (err) {
-          console.warn('Error invoking requestFullscreen:', err);
+        } catch {
+          // Handled gracefully without warnings
         }
       }
     } else {
@@ -405,8 +467,8 @@ export default function App() {
           if (promise && typeof promise.catch === 'function') {
             promise.catch?.(() => {});
           }
-        } catch (err) {
-          console.warn('Error invoking exitFullscreen:', err);
+        } catch {
+          // Handled gracefully without warnings
         }
       }
     }

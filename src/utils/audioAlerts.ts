@@ -317,8 +317,8 @@ class AudioAlertSystem {
         osc.start(ctx.currentTime + idx * 0.22);
         osc.stop(ctx.currentTime + idx * 0.22 + 1.7);
       });
-    } catch (e) {
-      console.warn('Audio chime playback failed:', e);
+    } catch {
+      // Audio playback handled gracefully
     }
   }
 
@@ -345,8 +345,8 @@ class AudioAlertSystem {
 
       osc.start(ctx.currentTime);
       osc.stop(ctx.currentTime + duration + 0.1);
-    } catch (e) {
-      console.warn('Iqamah beep failed:', e);
+    } catch {
+      // Iqamah beep handled gracefully
     }
   }
 
@@ -375,8 +375,8 @@ class AudioAlertSystem {
         osc.start(ctx.currentTime + delay);
         osc.stop(ctx.currentTime + delay + dur + 0.1);
       });
-    } catch (e) {
-      console.warn('Iqamah arrival alert failed:', e);
+    } catch {
+      // Iqamah arrival alert handled gracefully
     }
   }
 
@@ -413,8 +413,8 @@ class AudioAlertSystem {
           this.playNabawiChime(volume, isFinal);
           break;
       }
-    } catch (e) {
-      console.warn('Alarm tone failed:', e);
+    } catch {
+      // Alarm tone handled gracefully
     }
   }
 
@@ -427,8 +427,8 @@ class AudioAlertSystem {
           this.playAlarmBeepOnce(volume, isFinal, toneType);
         }, i * 1000);
       }
-    } catch (e) {
-      console.warn('Adzan 5s alarm failed:', e);
+    } catch {
+      // Adzan 5s alarm preview handled gracefully
     }
   }
 }

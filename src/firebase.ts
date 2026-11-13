@@ -60,10 +60,8 @@ export async function testConnection(): Promise<boolean> {
   try {
     await getDocFromServer(doc(db, 'settings', 'connection-test'));
     return true;
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.warn("Firebase client is offline. Local cache will be used.");
-    }
+  } catch {
+    // Graceful offline fallback without emitting browser console warnings
     return false;
   }
 }

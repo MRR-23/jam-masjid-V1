@@ -93,8 +93,8 @@ export const MediaSlider: React.FC<MediaSliderProps> = ({
       videoRef.current.currentTime = 0;
       const playPromise = videoRef.current.play();
       if (playPromise !== undefined) {
-        playPromise.catch((err) => {
-          console.warn('Video autoplay notice:', err);
+        playPromise.catch(() => {
+          // Handled gracefully: browser autoplay deferred until user interaction
         });
       }
     }
@@ -135,7 +135,6 @@ export const MediaSlider: React.FC<MediaSliderProps> = ({
   };
 
   const handleVideoError = useCallback(() => {
-    console.warn('Video slide playback failed, advancing to next slide');
     if (totalSlides > 1) {
       setCurrentIndex((curr) => (curr + 1) % totalSlides);
     }

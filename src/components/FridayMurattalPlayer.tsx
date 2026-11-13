@@ -70,8 +70,8 @@ export const FridayMurattalPlayer: React.FC<FridayMurattalPlayerProps> = ({
           ...data
         }));
       }
-    }, (error) => {
-      console.warn("Firestore murattal listener notice:", error?.message);
+    }, () => {
+      // Offline fallback: handled gracefully
     });
 
     return () => unsubscribe();
@@ -90,8 +90,8 @@ export const FridayMurattalPlayer: React.FC<FridayMurattalPlayerProps> = ({
       
       const progressDocRef = doc(db, 'murattal_progress', 'current');
       await setDoc(progressDocRef, updated, { merge: true });
-    } catch (e) {
-      console.warn("Failed to sync murattal to cloud:", e);
+    } catch {
+      // Handled locally
     }
   }, [progress, onProgressUpdate]);
 
@@ -109,8 +109,8 @@ export const FridayMurattalPlayer: React.FC<FridayMurattalPlayerProps> = ({
     if (progress.isPlaying) {
       const playPromise = audioRef.current.play();
       if (playPromise !== undefined) {
-        playPromise.catch((err) => {
-          console.warn("Autoplay audio blocked or pending user interaction:", err?.message);
+        playPromise.catch(() => {
+          // Handled gracefully: pending user gesture
         });
       }
     } else {
@@ -239,7 +239,7 @@ export const FridayMurattalPlayer: React.FC<FridayMurattalPlayerProps> = ({
         onTimeUpdate={handleTimeUpdate}
         onEnded={handleEnded}
         onError={() => {
-          console.warn("Audio source loading notice for URL:", currentAudioUrl);
+          // Audio source loading handled gracefully
         }}
         preload="auto"
       />

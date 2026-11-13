@@ -20,7 +20,18 @@ import {
 import { soundManager } from '../utils/audioAlerts';
 import { THEME_PALETTES } from '../utils/themePalettes';
 import { processUploadedMedia, isVideoFile } from '../utils/imageCompressor';
-import { checkStorageHealth, StorageHealth, saveMosqueConfig, storeSlideMedia, deleteSlideMedia } from '../utils/storageManager';
+import { 
+  checkStorageHealth, 
+  StorageHealth, 
+  saveMosqueConfig, 
+  storeSlideMedia, 
+  deleteSlideMedia,
+  syncSlideToCloud,
+  deleteSlideFromCloud,
+  syncHimbauanToCloud,
+  deleteHimbauanFromCloud,
+  backfillLocalMediaToCloud
+} from '../utils/storageManager';
 import { DEFAULT_MOSQUE_CONFIG } from '../utils/defaultConfig';
 import { 
   X, Save, Volume2, Moon, Sun, 
@@ -116,9 +127,14 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
     return () => clearInterval(interval);
   }, [activeTab, slidePreviewPlaying, slidesCount]);
 
-  // Sync formData whenever config updates or drawer opens
+  const prevIsOpenRef = useRef(false);
+
+  // Sync formData when drawer opens (without clobbering active typing while drawer remains open)
   useEffect(() => {
-    if (isOpen && config) {
+    const justOpened = isOpen && !prevIsOpenRef.current;
+    prevIsOpenRef.current = isOpen;
+
+    if (justOpened && config) {
       setFormData({
         ...DEFAULT_MOSQUE_CONFIG,
         ...config,
@@ -148,6 +164,23 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
           : DEFAULT_MOSQUE_CONFIG.runningTexts
       });
       checkStorageHealth().then(setStorageHealth).catch(() => {});
+    } else if (isOpen && config && Array.isArray(config.slides)) {
+      // Keep slide URLs updated if cloud slides finish hydrating while drawer is open
+      setFormData((prev) => {
+        const prevSlides = Array.isArray(prev.slides) ? prev.slides : [];
+        let changed = false;
+        const updatedSlides = prevSlides.map((ps) => {
+          if (!ps.url) {
+            const incoming = config.slides.find((cs) => cs.id === ps.id);
+            if (incoming && incoming.url) {
+              changed = true;
+              return { ...ps, url: incoming.url, thumbnailUrl: incoming.thumbnailUrl || ps.thumbnailUrl };
+            }
+          }
+          return ps;
+        });
+        return changed ? { ...prev, slides: updatedSlides } : prev;
+      });
     }
   }, [isOpen, config]);
 
@@ -176,8 +209,8 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
       await onSaveConfig(formData);
       setSavedSuccess(true);
       setTimeout(() => setSavedSuccess(false), 3000);
-    } catch (err: any) {
-      console.warn('Error saving config in drawer:', err);
+    } catch {
+      // Handled cleanly
     }
   };
 
@@ -215,7 +248,7 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
     }));
   };
 
-  const handleAddSlide = () => {
+  const handleAddSlide = async () => {
     if (!newSlideUrl.trim()) return;
     const item: MediaSlideItem = {
       id: `slide-${Date.now()}`,
@@ -225,12 +258,17 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
       durationSeconds: formData.slideTransitionDuration || 15,
       active: true
     };
-    setFormData(prev => ({
-      ...prev,
-      slides: [...(prev.slides || []), item]
-    }));
+    const updatedSlides = [...safeSlides, item];
+    const updatedConfig = {
+      ...formData,
+      slides: updatedSlides
+    };
+    setFormData(updatedConfig);
     setNewSlideUrl('');
     setNewSlideTitle('');
+    await syncSlideToCloud(item, item.url);
+    await saveMosqueConfig(updatedConfig);
+    await onSaveConfig(updatedConfig);
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -241,18 +279,19 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
 
     const newSlides: MediaSlideItem[] = [];
     let successCount = 0;
-    let failCount = 0;
+    let cloudSyncedCount = 0;
+    let videoTooLargeCount = 0;
 
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const isVideo = isVideoFile(file);
-      setUploadFeedback(`Memproses ${i + 1}/${files.length}: ${file.name} (${isVideo ? 'Video' : 'Foto'})...`);
+      setUploadFeedback(`Memproses & menyinkronkan ${i + 1}/${files.length}: ${file.name} (${isVideo ? 'Video' : 'Foto'})...`);
 
       try {
         const processed = await processUploadedMedia(file);
         const newSlideId = `slide-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 7)}`;
 
-        // Persist media directly into IndexedDB media_vault (no data URL length limits for videos)
+        // Persist media directly into IndexedDB media_vault
         await storeSlideMedia(newSlideId, {
           type: processed.type,
           blob: processed.blob,
@@ -271,9 +310,20 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
         };
         newSlides.push(newSlide);
         successCount++;
+
+        // Sync slide (photo OR video up to 20MB) to Cloud Firestore so ALL accounts & devices receive it
+        const cloudResult = await syncSlideToCloud(
+          newSlide,
+          processed.type === 'image' ? processed.url : undefined,
+          processed.blob
+        );
+        if (cloudResult.synced) {
+          cloudSyncedCount++;
+        } else if (cloudResult.reason === 'too_large') {
+          videoTooLargeCount++;
+        }
       } catch (err: any) {
         console.error(`Gagal memproses berkas ${file.name}:`, err);
-        failCount++;
       }
     }
 
@@ -285,16 +335,22 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
       };
       setFormData(updatedConfig);
 
-      // Save locally and immediately apply to active TV display
+      // Save locally and immediately apply to cloud & active TV display
       await saveMosqueConfig(updatedConfig);
       await onSaveConfig(updatedConfig);
 
       const videoCount = newSlides.filter(s => s.type === 'video').length;
       const photoCount = newSlides.filter(s => s.type === 'image').length;
-      setUploadFeedback(
-        `Berhasil mengunggah ${successCount} media (${photoCount > 0 ? `${photoCount} foto` : ''}${photoCount > 0 && videoCount > 0 ? ', ' : ''}${videoCount > 0 ? `${videoCount} video` : ''})! Layar TV langsung diperbarui.`
-      );
-      setTimeout(() => setUploadFeedback(null), 5000);
+      if (videoTooLargeCount > 0) {
+        setUploadFeedback(
+          `Berhasil mengunggah ${successCount} media (${cloudSyncedCount} tersinkron cloud). Catatan: ${videoTooLargeCount} video > 20MB disimpan lokal di perangkat ini.`
+        );
+      } else {
+        setUploadFeedback(
+          `Berhasil mengunggah ${successCount} media (${photoCount > 0 ? `${photoCount} foto` : ''}${photoCount > 0 && videoCount > 0 ? ', ' : ''}${videoCount > 0 ? `${videoCount} video` : ''}) & tersinkron ke semua akun/perangkat!`
+        );
+      }
+      setTimeout(() => setUploadFeedback(null), 6000);
     } else {
       setUploadFeedback(`Gagal memproses berkas media yang dipilih.`);
       setTimeout(() => setUploadFeedback(null), 4000);
@@ -306,6 +362,7 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
   const handleClearAllSlides = async () => {
     for (const s of safeSlides) {
       deleteSlideMedia(s.id).catch(() => {});
+      deleteSlideFromCloud(s.id).catch(() => {});
     }
     const updated = {
       ...formData,
@@ -314,7 +371,7 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
     setFormData(updated);
     await saveMosqueConfig(updated);
     await onSaveConfig(updated);
-    setUploadFeedback('Semua slide telah dikosongkan.');
+    setUploadFeedback('Semua slide telah dikosongkan di seluruh perangkat.');
     setTimeout(() => setUploadFeedback(null), 3000);
   };
 
@@ -333,6 +390,9 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
         dataUrl: processed.url,
         thumbnailUrl: processed.thumbnailUrl
       });
+
+      // Sync Himbauan poster to cloud Firestore so all screens show it
+      await syncHimbauanToCloud(processed.url);
 
       const updatedHimbauan = {
         enabled: formData.himbauan?.enabled ?? true,
@@ -364,6 +424,7 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
 
   const handleRemoveHimbauanPhoto = async () => {
     deleteSlideMedia('himbauan_image').catch(() => {});
+    await deleteHimbauanFromCloud();
     const updatedHimbauan = {
       ...(formData.himbauan || { enabled: true, durationSeconds: 60 }),
       imageUrl: ''
@@ -375,7 +436,7 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
     setFormData(updatedConfig);
     await saveMosqueConfig(updatedConfig);
     await onSaveConfig(updatedConfig);
-    setUploadFeedback('Foto himbauan telah dihapus. Menggunakan tampilan grafis hadits shaf bawaan.');
+    setUploadFeedback('Foto himbauan telah dihapus di seluruh perangkat. Menggunakan tampilan grafis hadits shaf bawaan.');
     setTimeout(() => setUploadFeedback(null), 4000);
   };
 
@@ -420,6 +481,7 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
 
   const handleRemoveSlide = async (id: string) => {
     await deleteSlideMedia(id);
+    await deleteSlideFromCloud(id);
     const updatedSlides = safeSlides.filter(s => s.id !== id);
     const updated = { ...formData, slides: updatedSlides };
     setFormData(updated);
@@ -2684,16 +2746,31 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
                       </p>
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      checkStorageHealth().then(setStorageHealth).catch(() => {});
-                    }}
-                    className="p-1.5 text-xs text-[#EBDDC3] hover:text-[#D4AF37] hover:bg-[#123828] rounded-lg border border-[#D4AF37]/25 transition-colors cursor-pointer"
-                    title="Periksa ulang status penyimpanan"
-                  >
-                    <RotateCw className="w-3.5 h-3.5" />
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        await onSaveConfig(formData);
+                        const synced = await backfillLocalMediaToCloud(formData, new Set<string>());
+                        checkStorageHealth().then(setStorageHealth).catch(() => {});
+                        setUploadFeedback(
+                          synced > 0
+                            ? `Berhasil menyinkronkan ${synced} media + seluruh pengaturan ke Cloud untuk semua akun!`
+                            : 'Seluruh data & media sudah tersinkronisasi ke Cloud untuk semua akun!'
+                        );
+                        setSavedSuccess(true);
+                        setTimeout(() => {
+                          setSavedSuccess(false);
+                          setUploadFeedback(null);
+                        }, 4000);
+                      }}
+                      className="px-2.5 py-1.5 text-[10px] font-bold text-[#071C14] bg-gradient-to-r from-[#E5C158] to-[#D4AF37] hover:brightness-110 rounded-lg shadow transition-all cursor-pointer flex items-center gap-1"
+                      title="Paksa sinkronisasi semua data & slide ke cloud agar tampil di akun/perangkat lain"
+                    >
+                      <RotateCw className="w-3 h-3" />
+                      <span>Sinkron Semua Akun</span>
+                    </button>
+                  </div>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1">
@@ -2731,15 +2808,15 @@ export const AdminDrawer: React.FC<AdminDrawerProps> = ({
                   <div className="bg-[#071C14]/90 p-2.5 rounded-xl border border-[#D4AF37]/20 flex flex-col justify-between">
                     <div className="flex items-center gap-1.5 text-[11px] font-bold text-[#FAF6EE] mb-1">
                       <ShieldCheck className="w-3.5 h-3.5 text-[#D4AF37]" />
-                      <span>Cloud Database</span>
+                      <span>Cloud Lintas Akun</span>
                     </div>
                     <div className="flex items-center gap-1.5">
                       <span className={`w-2 h-2 rounded-full ${isCloudSynced ? 'bg-[#22C55E]' : 'bg-[#E5C158]'}`}></span>
                       <span className={`text-[10px] font-semibold ${isCloudSynced ? 'text-[#4ADE80]' : 'text-[#E5C158]'}`}>
-                        {isCloudSynced ? 'Terhubung Online' : 'Siaga Offline'}
+                        {isCloudSynced ? 'Terhubung Semua Akun' : 'Siaga Offline'}
                       </span>
                     </div>
-                    <p className="text-[9px] text-[#9E9075] mt-1">Database Firestore tersertifikasi</p>
+                    <p className="text-[9px] text-[#9E9075] mt-1">Sinkron otomatis pengaturan, foto & video antar akun</p>
                   </div>
                 </div>
               </div>
